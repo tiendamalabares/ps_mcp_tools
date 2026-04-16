@@ -1,0 +1,51 @@
+{
+    "name": "prestashopcorp/ps_mcp",
+    "description": "PrestaShop MCP Tools is an tooling pack for ps_mcp module which allows to manage your shop with LLM",
+    "type": "prestashop-module",
+    "authors": [
+        {
+            "name": "CloudSync team",
+            "email": "cloudsync-support@prestashop.com",
+            "homepage": "https://github.com/PrestaShopCorp/ps_mcp",
+            "role": "Developer"
+        }
+    ],
+    "license": "proprietary",
+    "config": {
+        "preferred-install": "dist",
+        "platform": {
+            "php": "8.1"
+        },
+        "optimize-autoloader": true,
+        "prepend-autoloader": false,
+        "platform-check": false
+    },
+    "autoload": {
+        "classmap": [
+            "ps_mcp_tools.php"
+        ],
+        "psr-4": {
+            "PrestaShop\\Module\\PsMcpTools\\": "src/"
+        }
+    },
+    "require": {
+        "php": ">=8.1"
+    },
+    "require-dev": {
+        "prestashop/php-dev-tools": "^5.0.0",
+        "phpstan/phpstan": "^2.1",
+        "friendsofphp/php-cs-fixer": "^3.85",
+        "phpseclib/phpseclib": "^3.0.46",
+        "prestashop/header-stamp": "^2.6",
+        "prestashop/autoindex": "^2.1"
+    },
+    "extra": {
+        "prestashop": {
+            "autoload": {
+                "psr-4": {
+                    "PrestaShop\\Module\\PsMcpTools\\": "src/"
+                }
+            }
+        }
+    }
+}
