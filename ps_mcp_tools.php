@@ -51,7 +51,7 @@ class Ps_mcp_tools extends Module
         $this->author = 'PrestaShop SA';
         $this->need_instance = 0;
         $this->bootstrap = true;
-        $this->version = '0.2.0';
+        $this->version = '0.3.0';
         $this->module_key = '986b05ecb504f95774d3df413cb6542a';
 
         parent::__construct();

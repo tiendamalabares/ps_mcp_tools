@@ -32,9 +32,21 @@ The module provides the following MCP tools:
 -   **CustomerTools**: Manage customer accounts, retrieve customer information, and perform customer-related operations
 -   **OrderTools**: Handle order management, retrieve order details, and process order operations
 -   **ProductTools**: Manage products, categories, and product-related data
+-   **ProductImageTools**: Manage product images
 -   **LanguageTools**: Handle language and localization operations
+-   **CreativeElementsTools**: Read and write Creative Elements page-builder designs (CMS pages, products, categories, templates and revisions)
 
-All tools interact with PrestaShop through the SOAP webservices API, ensuring secure and standardized access to your store data.
+Most tools interact with PrestaShop through the SOAP webservices API, ensuring secure and standardized access to your store data. `CreativeElementsTools` is the exception: Creative Elements does not expose a webservice resource, so it reads/writes its storage directly (`ps_ce_meta`, `ps_ce_template`, `ps_ce_revision`), preferring Creative Elements' own save API when available.
+
+### Creative Elements tools
+
+-   `ce_get_page(type, objectId, langId, shopId)`: retrieve the design (`_elementor_data`/`_elementor_page_settings`) stored for a CMS page, product, category or template.
+-   `ce_save_page(type, objectId, langId, shopId, elements, settings?)`: save a full design. Automatically backs up the previous design as a revision first.
+-   `ce_list_templates()` / `ce_import_template(template)`: list and import local library templates (same JSON export format used by the page builder).
+-   `ce_clear_cache(uid?)`: force regeneration of the CSS cache for a page, or globally.
+-   `ce_list_revisions(type, objectId, langId, shopId)` / `ce_restore_revision(revisionId)`: inspect and roll back to a previous revision.
+
+Writes can be restricted to specific pages via the `PS_MCP_CE_ALLOWED_TARGETS` configuration key (comma-separated `type:objectId` pairs, e.g. `7:105`); leave it empty to allow writes anywhere. Every write is logged via `PrestaShopLogger`.
 
 ## Usage
 
@@ -47,13 +59,14 @@ This module is designed to work with the PS MCP Server module. Once installed, t
 ```
 ps_mcp_tools/
 ├── src/
-│   ├── AbstractWebserviceTools.php  # Base class for webservice tools
-│   ├── CustomerTools.php            # Customer management tools
-│   ├── LanguageTools.php            # Language management tools
-│   ├── OrderTools.php               # Order management tools
-│   └── ProductTools.php             # Product management tools
-├── tests/                           # Test files
-└── ps_mcp_tools.php                 # Main module file
+│   ├── Webservice/                     # Base classes for webservice-backed tools
+│   ├── CreativeElementsTools.php       # Creative Elements page-builder tools
+│   ├── CustomerTools.php               # Customer management tools
+│   ├── LanguageTools.php               # Language management tools
+│   ├── OrderTools.php                  # Order management tools
+│   ├── ProductImageTools.php           # Product image management tools
+│   └── ProductTools.php                # Product management tools
+└── ps_mcp_tools.php                    # Main module file
 ```
 
 ### Requirements for Development
