@@ -20,27 +20,40 @@ if (!defined('_PS_VERSION_')) {
  * Tools to read and write Creative Elements (page builder) designs.
  *
  * Creative Elements does not expose a webservice resource, so these tools talk
- * to its storage directly: designs live in `ps_ce_meta`, keyed by a composite
- * "uid" ({objectId}{type:2}{langId:2}{shopId:2}), templates live in
- * `ps_ce_template` (with their content also in `ps_ce_meta`), and revisions
- * live in `ps_ce_revision`. Writes prefer Creative Elements' own API
- * (CE\Plugin::$instance->documents->get($uid)->save(...)) when available, so
- * that revisions, CSS cache and plain-text indexes are handled the same way
- * the page builder itself would; a direct-SQL fallback is used otherwise.
+ * to its storage directly (verified against creativeelements 2.14.0 source):
+ * - designs live in `ps_ce_meta` (id, name, value), keyed by a composite
+ *   "uid" = {objectId}{type:2}{langId:2}{shopId:2} (see CE\UId).
+ * - templates are `ps_ce_template` rows (CETemplate ObjectModel); their
+ *   actual builder JSON still lives in `ps_ce_meta` under that template's uid
+ *   (type=1), same as any other document.
+ * - revisions are `ps_ce_revision` rows (CERevision ObjectModel): parent
+ *   (the uid, as string), id_employee, title, type, content, active, date_upd.
+ *
+ * Writes prefer Creative Elements' own API
+ * (CE\Plugin::instance()->documents->get($uid)->save(...)) when it is usable.
+ * In practice that API silently no-ops (`save()` returns `false`) unless the
+ * current PrestaShop context has an employee with edit rights on the
+ * relevant admin controller (CE\User::isCurrentUserCanEdit()) - which an
+ * MCP/headless call usually does not have - so every write here checks the
+ * real return value and falls back to a direct, schema-aware SQL write
+ * (with its own revision backup and CSS cache invalidation) whenever the
+ * native path isn't usable or didn't actually apply.
  */
 class CreativeElementsTools
 {
-    // Creative Elements object types (see CE\UId)
+    // Creative Elements object types (CE\UId constants)
     private const TYPE_REVISION = 0;
     private const TYPE_TEMPLATE = 1;
     private const TYPE_CONTENT = 2;
     private const TYPE_PRODUCT = 3;
     private const TYPE_CATEGORY = 4;
+    private const TYPE_MANUFACTURER = 5;
+    private const TYPE_SUPPLIER = 6;
     private const TYPE_CMS = 7;
     private const TYPE_CMS_CATEGORY = 8;
     private const TYPE_THEME = 17;
 
-    private const TYPE_DESCRIPTION = 'Creative Elements object type: 0=revision, 1=template, 2=content, 3=product, 4=category, 7=CMS page, 8=CMS category, 17=theme.';
+    private const TYPE_DESCRIPTION = 'Creative Elements object type: 0=revision, 1=template, 2=content (hooks), 3=product, 4=category, 5=manufacturer, 6=supplier, 7=CMS page, 8=CMS category, 17=theme.';
 
     // ps_ce_meta.name keys used by Creative Elements
     private const META_DATA = '_elementor_data';
@@ -58,19 +71,29 @@ class CreativeElementsTools
      */
     private const CONFIG_ALLOWED_TARGETS = 'PS_MCP_CE_ALLOWED_TARGETS';
 
-    /**
-     * Candidate FQCNs for Creative Elements' local template library source,
-     * tried in order since the exact namespace is not part of any public API.
-     */
-    private const TEMPLATE_LIBRARY_CLASSES = [
-        '\\CE\\TemplateLibrary\\Sources\\Local',
-        '\\CE\\TemplateLibrary\\Sources\\SourceLocal',
-        '\\CE\\Includes\\TemplateLibrary\\Sources\\Local',
-        '\\CE\\Includes\\TemplateLibrary\\Sources\\SourceLocal',
-    ];
+    /** @var bool|null Cached result of bootstrapping CE\Plugin for this request */
+    private static ?bool $nativeApiReady = null;
 
     /** @var array<int, string>|null Cached column list of ps_ce_revision */
     private static ?array $revisionColumns = null;
+
+    /** @var bool Whether error suppression is active (mirrors AbstractWebservice) */
+    private static bool $errorSuppressionActive = false;
+
+    public function __construct()
+    {
+        // Some Creative Elements code paths touch globals (e.g. $GLOBALS['employee'])
+        // that may be unset outside a normal front/admin request; a stray PHP
+        // warning here must not corrupt the MCP JSON-RPC response stream.
+        if (!self::$errorSuppressionActive) {
+            ini_set('display_errors', '0');
+            ini_set('log_errors', '1');
+            set_error_handler(function () {
+                return true;
+            }, E_ALL);
+            self::$errorSuppressionActive = true;
+        }
+    }
 
     #[\PhpMcp\Server\Attributes\McpTool(
         name: 'ce_get_page',
@@ -80,8 +103,8 @@ class CreativeElementsTools
         properties: [
             'type' => ['type' => 'integer', 'description' => self::TYPE_DESCRIPTION],
             'objectId' => ['type' => 'integer', 'description' => 'ID of the CMS page / product / category / template.'],
-            'langId' => ['type' => 'integer', 'description' => 'Language ID (use 0 for templates, which are not translated).'],
-            'shopId' => ['type' => 'integer', 'description' => 'Shop ID (use 0 for templates).'],
+            'langId' => ['type' => 'integer', 'description' => 'Language ID (ignored for templates, which are not translated).'],
+            'shopId' => ['type' => 'integer', 'description' => 'Shop ID (ignored for templates).'],
         ],
         required: ['type', 'objectId', 'langId', 'shopId']
     )]
@@ -157,15 +180,22 @@ class CreativeElementsTools
         $revisionCreated = $previousData !== null && $this->createRevision($uid, $previousData);
 
         $usedNativeApi = false;
-        if ($this->nativeApiAvailable()) {
-            $document = \CE\Plugin::$instance->documents->get($uid);
-            if ($document !== null) {
-                $payload = ['elements' => $elements];
-                if ($settings !== null) {
-                    $payload['settings'] = $settings;
+        if ($this->bootstrapNativeApi()) {
+            try {
+                $document = \CE\Plugin::$instance->documents->get($uid);
+                if ($document) {
+                    $payload = ['elements' => $elements];
+                    if ($settings !== null) {
+                        $payload['settings'] = $settings;
+                    }
+                    // save() returns exactly `true` on success and `false` if the
+                    // current context has no employee with edit rights on this
+                    // page - which silently does nothing, so only `=== true`
+                    // counts as a real save.
+                    $usedNativeApi = true === $document->save($payload);
                 }
-                $document->save($payload);
-                $usedNativeApi = true;
+            } catch (\Throwable $e) {
+                $this->logChange('ce_native_save_failed', $uid, ['error' => $e->getMessage()]);
             }
         }
 
@@ -197,7 +227,7 @@ class CreativeElementsTools
     public function ceListTemplates(): array
     {
         $sql = new \DbQuery();
-        $sql->select('*')->from('ce_template')->orderBy('id ASC');
+        $sql->select('*')->from('ce_template')->orderBy('id_ce_template ASC');
         $rows = \Db::getInstance()->executeS($sql);
 
         return ['templates' => is_array($rows) ? $rows : []];
@@ -231,39 +261,63 @@ class CreativeElementsTools
         }
 
         $title = (string) ($template['title'] ?? 'Imported template');
+        $templateType = (string) ($template['type'] ?? 'page');
+        $pageSettings = is_array($template['page_settings'] ?? null) ? $template['page_settings'] : [];
 
-        foreach (self::TEMPLATE_LIBRARY_CLASSES as $class) {
-            if (class_exists($class) && method_exists($class, 'importTemplate')) {
-                $result = $class::importTemplate($template);
+        $usedNativeApi = false;
+        $uid = null;
 
-                $this->logChange('ce_import_template', 0, ['title' => $title, 'usedNativeApi' => true, 'class' => $class]);
-
-                return ['imported' => true, 'usedNativeApi' => true, 'result' => $result];
+        if ($this->bootstrapNativeApi()) {
+            try {
+                $source = \CE\Plugin::$instance->templates_manager->getSource('local');
+                if ($source) {
+                    // CE\TemplateLibraryXSourceLocal::saveItem() - real API used by
+                    // the "Save as template" feature in the builder itself.
+                    $result = $source->saveItem([
+                        'title' => $title,
+                        'type' => $templateType,
+                        'content' => $template['content'],
+                        'page_settings' => $pageSettings,
+                    ]);
+                    if (!($result instanceof \CE\WPError) && $result) {
+                        // saveItem() returns the document's main id, which for CE
+                        // documents is the composite uid string, not the raw
+                        // ps_ce_template.id_ce_template.
+                        $uid = (int) $result;
+                        $usedNativeApi = true;
+                    }
+                }
+            } catch (\Throwable $e) {
+                $this->logChange('ce_native_import_template_failed', 0, ['error' => $e->getMessage()]);
             }
         }
 
-        // Fallback: create the template row and its meta entries directly.
-        $db = \Db::getInstance();
-        $inserted = $db->insert('ce_template', [
-            'title' => $title,
-            'type' => (string) ($template['type'] ?? 'page'),
-            'date_add' => date('Y-m-d H:i:s'),
-            'date_upd' => date('Y-m-d H:i:s'),
-        ]);
-        if (!$inserted) {
-            throw new \PrestaShopException('Failed to insert into ce_template: ' . $db->getMsgError());
+        if (!$usedNativeApi) {
+            $employeeId = $this->getCurrentEmployeeId();
+
+            $tpl = new \CETemplate();
+            $tpl->id_employee = $employeeId;
+            $tpl->title = $title;
+            $tpl->type = $templateType;
+            $tpl->position = 0;
+            $tpl->active = 1;
+            $tpl->date_add = date('Y-m-d H:i:s');
+            $tpl->date_upd = date('Y-m-d H:i:s');
+
+            if (!$tpl->add()) {
+                throw new \PrestaShopException('Failed to insert into ce_template: ' . \Db::getInstance()->getMsgError());
+            }
+
+            $uid = $this->buildUid(self::TYPE_TEMPLATE, (int) $tpl->id, 0, 0);
+            $this->writeDesignDirectly($uid, $template['content'], $pageSettings ?: null);
+            if (isset($template['version'])) {
+                $this->setMetaValue($uid, self::META_VERSION, (string) $template['version']);
+            }
         }
-        $templateId = (int) $db->Insert_ID();
-        $uid = $this->buildUid(self::TYPE_TEMPLATE, $templateId, 0, 0);
 
-        $this->writeDesignDirectly($uid, $template['content'], is_array($template['page_settings'] ?? null) ? $template['page_settings'] : null);
-        if (isset($template['version'])) {
-            $this->setMetaValue($uid, self::META_VERSION, (string) $template['version']);
-        }
+        $this->logChange('ce_import_template', $uid ?? 0, ['title' => $title, 'usedNativeApi' => $usedNativeApi]);
 
-        $this->logChange('ce_import_template', $uid, ['title' => $title, 'usedNativeApi' => false, 'templateId' => $templateId]);
-
-        return ['imported' => true, 'usedNativeApi' => false, 'templateId' => $templateId, 'uid' => $uid];
+        return ['imported' => true, 'usedNativeApi' => $usedNativeApi, 'uid' => $uid];
     }
 
     #[\PhpMcp\Server\Attributes\McpTool(
@@ -285,9 +339,13 @@ class CreativeElementsTools
             $cleared[] = (string) $uid;
         }
 
-        if ($this->nativeApiAvailable() && isset(\CE\Plugin::$instance->files_manager)) {
-            \CE\Plugin::$instance->files_manager->clearCache();
-            $cleared[] = 'global';
+        if ($this->bootstrapNativeApi() && isset(\CE\Plugin::$instance->files_manager)) {
+            try {
+                \CE\Plugin::$instance->files_manager->clearCache();
+                $cleared[] = 'global';
+            } catch (\Throwable $e) {
+                $this->logChange('ce_native_clear_cache_failed', $uid ?? 0, ['error' => $e->getMessage()]);
+            }
         }
 
         $this->logChange('ce_clear_cache', $uid ?? 0, ['cleared' => $cleared]);
@@ -311,12 +369,9 @@ class CreativeElementsTools
     public function ceListRevisions(int $type, int $objectId, int $langId, int $shopId): array
     {
         $uid = $this->buildUid($type, $objectId, $langId, $shopId);
-        $columns = $this->getRevisionColumns();
-        $uidColumn = $this->resolveRevisionUidColumn($columns);
 
         $sql = new \DbQuery();
-        $sql->select('*')->from('ce_revision')->where($uidColumn . ' = ' . $uid);
-        $sql->orderBy(in_array('date_add', $columns, true) ? 'date_add DESC' : 'id DESC');
+        $sql->select('*')->from('ce_revision')->where('parent = \'' . pSQL((string) $uid) . '\'')->orderBy('id_ce_revision DESC');
 
         $rows = \Db::getInstance()->executeS($sql);
 
@@ -329,26 +384,22 @@ class CreativeElementsTools
     )]
     #[\PhpMcp\Server\Attributes\Schema(
         properties: [
-            'revisionId' => ['type' => 'integer', 'description' => 'ID of the revision row (from ce_list_revisions) to restore.'],
+            'revisionId' => ['type' => 'integer', 'description' => 'ID of the revision row (ce_revision.id_ce_revision, from ce_list_revisions) to restore.'],
         ],
         required: ['revisionId']
     )]
     public function ceRestoreRevision(int $revisionId): array
     {
-        $columns = $this->getRevisionColumns();
-        $uidColumn = $this->resolveRevisionUidColumn($columns);
-        $valueColumn = $this->resolveRevisionValueColumn($columns);
-
         $sql = new \DbQuery();
-        $sql->select('*')->from('ce_revision')->where('id = ' . $revisionId);
+        $sql->select('*')->from('ce_revision')->where('id_ce_revision = ' . $revisionId);
         $revision = \Db::getInstance()->getRow($sql);
 
         if (!$revision) {
             throw new \PrestaShopException(sprintf('Revision %d not found.', $revisionId));
         }
 
-        $uid = (int) $revision[$uidColumn];
-        $content = (string) $revision[$valueColumn];
+        $uid = (int) $revision['parent'];
+        $content = (string) $revision['content'];
         $target = $this->parseUid($uid);
 
         $this->assertWritable($target['type'], $target['objectId']);
@@ -358,11 +409,14 @@ class CreativeElementsTools
 
         $decoded = $this->decodeJsonOrRaw($content);
         $usedNativeApi = false;
-        if (is_array($decoded) && $this->nativeApiAvailable()) {
-            $document = \CE\Plugin::$instance->documents->get($uid);
-            if ($document !== null) {
-                $document->save(['elements' => $decoded]);
-                $usedNativeApi = true;
+        if (is_array($decoded) && $this->bootstrapNativeApi()) {
+            try {
+                $document = \CE\Plugin::$instance->documents->get($uid);
+                if ($document) {
+                    $usedNativeApi = true === $document->save(['elements' => $decoded]);
+                }
+            } catch (\Throwable $e) {
+                $this->logChange('ce_native_restore_failed', $uid, ['error' => $e->getMessage()]);
             }
         }
 
@@ -403,12 +457,18 @@ class CreativeElementsTools
             }
         }
 
+        if ($this->getMetaValue($uid, self::META_EDIT_MODE) === null) {
+            $this->setMetaValue($uid, self::META_EDIT_MODE, 'builder');
+        }
+
         $this->setMetaValue($uid, self::META_DATE_UPD, date('Y-m-d H:i:s'));
         $this->deleteMetaKey($uid, self::META_CSS);
     }
 
     /**
      * Build the composite Creative Elements uid: {objectId}{type:2}{langId:2}{shopId:2}.
+     * Mirrors CE\UId: revisions and templates (type <= 1) are not per-language
+     * or per-shop, so langId/shopId are forced to 0 for them.
      */
     private function buildUid(int $type, int $objectId, int $langId, int $shopId): int
     {
@@ -417,6 +477,10 @@ class CreativeElementsTools
         }
         if ($type < 0 || $type > 99 || $langId < 0 || $langId > 99 || $shopId < 0 || $shopId > 99) {
             throw new \InvalidArgumentException('type, langId and shopId must each be between 0 and 99.');
+        }
+        if ($type <= self::TYPE_TEMPLATE) {
+            $langId = 0;
+            $shopId = 0;
         }
 
         return (int) sprintf('%d%02d%02d%02d', $objectId, $type, $langId, $shopId);
@@ -479,9 +543,39 @@ class CreativeElementsTools
         ));
     }
 
-    private function nativeApiAvailable(): bool
+    /**
+     * Load the creativeelements module (if needed) and boot its CE\Plugin
+     * singleton. Memoized for the request: if it fails once (module
+     * disabled, or an exception during Plugin::instance()'s component
+     * initialization - e.g. because this call has no full front/admin
+     * request context) every tool falls back to the direct SQL path instead
+     * of retrying on every call.
+     */
+    private function bootstrapNativeApi(): bool
     {
-        return class_exists('CE\\Plugin') && isset(\CE\Plugin::$instance) && isset(\CE\Plugin::$instance->documents);
+        if (self::$nativeApiReady !== null) {
+            return self::$nativeApiReady;
+        }
+
+        try {
+            if (!class_exists('CE\\Plugin')) {
+                if (!\Module::isEnabled('creativeelements')) {
+                    return self::$nativeApiReady = false;
+                }
+                \Module::getInstanceByName('creativeelements');
+            }
+            if (!class_exists('CE\\Plugin')) {
+                return self::$nativeApiReady = false;
+            }
+
+            \CE\Plugin::instance();
+
+            return self::$nativeApiReady = (\CE\Plugin::$instance !== null && isset(\CE\Plugin::$instance->documents));
+        } catch (\Throwable $e) {
+            $this->logChange('ce_native_bootstrap_failed', 0, ['error' => $e->getMessage()]);
+
+            return self::$nativeApiReady = false;
+        }
     }
 
     /**
@@ -525,27 +619,46 @@ class CreativeElementsTools
     }
 
     /**
-     * Back up the previous design as a revision row. Never throws: if the
-     * revisions table schema is unexpected (this has happened before, see a
-     * missing "type" column after a failed 2.5.2 upgrade) the save must still
-     * go through, so failures here are logged instead of blocking the caller.
+     * Back up the previous design as a ce_revision row. Never throws: this
+     * must not block a save. Tries the CERevision ObjectModel first (clean,
+     * validated); if that fails - e.g. the known case where the `type`
+     * column is missing after a failed 2.5.2 upgrade - falls back to a raw
+     * insert that only includes columns that actually exist.
      */
     private function createRevision(int $uid, string $previousDataJson): bool
     {
+        $employeeId = $this->getCurrentEmployeeId();
+        $title = 'MCP backup ' . date('Y-m-d H:i:s');
+
+        try {
+            $revision = new \CERevision();
+            $revision->parent = (string) $uid;
+            $revision->id_employee = $employeeId;
+            $revision->title = $title;
+            $revision->type = 'mcp_backup';
+            $revision->content = $previousDataJson;
+            $revision->active = 1;
+            $revision->date_upd = date('Y-m-d H:i:s');
+
+            if ($revision->add()) {
+                return true;
+            }
+        } catch (\Throwable $e) {
+            // Fall through to the column-tolerant raw insert below.
+        }
+
         try {
             $columns = $this->getRevisionColumns();
-            $uidColumn = $this->resolveRevisionUidColumn($columns);
-            $valueColumn = $this->resolveRevisionValueColumn($columns);
-
             $data = [
-                $uidColumn => $uid,
-                $valueColumn => $previousDataJson,
+                'parent' => (string) $uid,
+                'id_employee' => $employeeId,
+                'title' => $title,
+                'content' => $previousDataJson,
+                'active' => 1,
+                'date_upd' => date('Y-m-d H:i:s'),
             ];
             if (in_array('type', $columns, true)) {
-                $data['type'] = self::TYPE_REVISION;
-            }
-            if (in_array('date_add', $columns, true)) {
-                $data['date_add'] = date('Y-m-d H:i:s');
+                $data['type'] = 'mcp_backup';
             }
 
             return (bool) \Db::getInstance()->insert('ce_revision', $data);
@@ -572,34 +685,6 @@ class CreativeElementsTools
     }
 
     /**
-     * @param array<int, string> $columns
-     */
-    private function resolveRevisionUidColumn(array $columns): string
-    {
-        foreach (['uid', 'id_ce_meta', 'id_post', 'id_page', 'post_id', 'id_content'] as $candidate) {
-            if (in_array($candidate, $columns, true)) {
-                return $candidate;
-            }
-        }
-
-        throw new \PrestaShopException('Unable to determine which column in ps_ce_revision references the page uid; please check the table schema manually.');
-    }
-
-    /**
-     * @param array<int, string> $columns
-     */
-    private function resolveRevisionValueColumn(array $columns): string
-    {
-        foreach (['value', 'content', 'data', 'post_content'] as $candidate) {
-            if (in_array($candidate, $columns, true)) {
-                return $candidate;
-            }
-        }
-
-        throw new \PrestaShopException('Unable to determine which column in ps_ce_revision stores the design content; please check the table schema manually.');
-    }
-
-    /**
      * @return mixed
      */
     private function decodeJsonOrRaw(string $value)
@@ -609,19 +694,25 @@ class CreativeElementsTools
         return $decoded !== null || $value === 'null' ? $decoded : $value;
     }
 
-    private function logChange(string $action, int $uid, array $context = []): void
+    private function getCurrentEmployeeId(): int
     {
-        $employeeId = null;
-        $context1 = \Context::getContext();
-        if ($context1 !== null && $context1->employee !== null && $context1->employee->id) {
-            $employeeId = (int) $context1->employee->id;
+        $context = \Context::getContext();
+        if ($context !== null && $context->employee !== null && $context->employee->id) {
+            return (int) $context->employee->id;
         }
 
+        return 0;
+    }
+
+    private function logChange(string $action, int $uid, array $context = []): void
+    {
+        $employeeId = $this->getCurrentEmployeeId();
+
         $message = sprintf(
-            '[PS MCP Tools][CreativeElements] %s uid=%d employee=%s context=%s',
+            '[PS MCP Tools][CreativeElements] %s uid=%d employee=%d context=%s',
             $action,
             $uid,
-            $employeeId !== null ? (string) $employeeId : 'n/a',
+            $employeeId,
             json_encode($context, JSON_UNESCAPED_UNICODE) ?: '{}'
         );
 

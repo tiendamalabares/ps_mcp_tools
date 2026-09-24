@@ -48,6 +48,8 @@ Most tools interact with PrestaShop through the SOAP webservices API, ensuring s
 
 Writes can be restricted to specific pages via the `PS_MCP_CE_ALLOWED_TARGETS` configuration key (comma-separated `type:objectId` pairs, e.g. `7:105`); leave it empty to allow writes anywhere. Every write is logged via `PrestaShopLogger`.
 
+Writes try Creative Elements' own `CE\Plugin::instance()->documents->get($uid)->save(...)` API first, but that API only actually writes if the current request has an employee with edit rights on the relevant admin controller (`CE\User::isCurrentUserCanEdit()`); otherwise it silently returns `false`. Since MCP tool calls normally run without a back-office session, `usedNativeApi` in the tool responses will usually be `false`, meaning the direct SQL path was used - which still creates a revision backup and clears the CSS cache, so the page renders correctly.
+
 ## Usage
 
 This module is designed to work with the PS MCP Server module. Once installed, the tools will be available through the MCP interface, allowing LLM applications to interact with your PrestaShop store.
